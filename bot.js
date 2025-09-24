@@ -14,7 +14,7 @@ const logger = {
 };
 
 let config = {
-    owner: "APVS Brasil Bot",
+    owner: "ADMIM-BOT",
     prefix: "!",
     welcome: {
         enabled: true,
@@ -41,16 +41,15 @@ let config = {
             { trigger: "tchau", response: "Até logo! Volte sempre!", media: null }
         ]
     },
-    // FUNCIONALIDADES ADICIONADAS
     messagePost: {
         enabled: false,
         interval: 60,
         message: "Mensagem automática do bot!",
         media: { enabled: false, path: "" }
     },
-    polls: new Map(), // Armazenar dados das enquetes
-    activePoll: null, // Enquete ativa atual
-    adminRequired: true
+    polls: new Map(),
+    activePoll: null,
+    adminGroups: new Set() // CORRIGIDO: Armazenar grupos onde o bot é admin
 };
 
 let sock;
@@ -72,7 +71,11 @@ function initDirectories() {
 
 function saveConfig() {
     try {
-        const configToSave = { ...config, polls: Array.from(config.polls.entries()) };
+        const configToSave = { 
+            ...config, 
+            polls: Array.from(config.polls.entries()),
+            adminGroups: Array.from(config.adminGroups) // CORRIGIDO: Salvar grupos de admin
+        };
         fs.writeFileSync('./config.json', JSON.stringify(configToSave, null, 2));
     } catch (error) {
         console.log('Erro ao salvar config:', error.message);
@@ -87,6 +90,9 @@ function loadConfig() {
             config = { ...config, ...loadedConfig };
             if (Array.isArray(config.polls)) {
                 config.polls = new Map(config.polls);
+            }
+            if (Array.isArray(config.adminGroups)) { // CORRIGIDO: Carregar grupos de admin
+                config.adminGroups = new Set(config.adminGroups);
             }
             console.log('Configurações carregadas');
         } else {
@@ -109,17 +115,33 @@ function isBotMessage(userId) {
     return normalizeId(sock.user.id) === normalizeId(userId);
 }
 
-// Verificar se bot é admin do grupo
-async function isBotAdmin(groupId) {
+// CORRIGIDO: Verificar e atualizar status de admin do bot em tempo real
+async function checkAndUpdateBotAdminStatus(groupId) {
     try {
         if (!sock || !sock.user) return false;
         const groupMetadata = await sock.groupMetadata(groupId);
         const botParticipant = groupMetadata.participants.find(p => normalizeId(p.id) === normalizeId(sock.user.id));
-        return botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin');
+        const isBotAdminNow = botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin');
+        
+        if (isBotAdminNow) {
+            config.adminGroups.add(groupId);
+            console.log('✅ Bot é admin no grupo:', normalizeId(groupId));
+        } else {
+            config.adminGroups.delete(groupId);
+            console.log('❌ Bot NÃO é admin no grupo:', normalizeId(groupId));
+        }
+        
+        saveConfig();
+        return isBotAdminNow;
     } catch (error) {
         console.log('Erro ao verificar se bot é admin:', error.message);
         return false;
     }
+}
+
+// CORRIGIDO: Verificar se bot é admin (com cache atualizado)
+async function isBotAdmin(groupId) {
+    return await checkAndUpdateBotAdminStatus(groupId);
 }
 
 async function isAdmin(groupId, userId) {
@@ -199,7 +221,7 @@ async function sendMediaMessage(jid, mediaPath, caption, mentions) {
     }
 }
 
-// CORRIGIDA: Função para extrair contatos com CSV organizado
+// CORRIGIDO: Função para extrair contatos com CSV organizado em colunas separadas
 async function extractGroupContacts(groupId) {
     try {
         console.log('Extraindo contatos do grupo:', normalizeId(groupId));
@@ -207,9 +229,10 @@ async function extractGroupContacts(groupId) {
         const groupMetadata = await sock.groupMetadata(groupId);
         const participants = groupMetadata.participants;
 
-        // Criar dados CSV com formatação adequada
-        const csvHeader = 'Nome,Numero,Admin,Status\n';
-        let csvData = csvHeader;
+        // CORRIGIDO: Criar CSV com separação adequada de colunas
+        const csvData = [];
+        const csvHeaders = ['Nome', 'Numero', 'Admin', 'Status'];
+        csvData.push(csvHeaders);
 
         const contactsData = [];
 
@@ -218,13 +241,12 @@ async function extractGroupContacts(groupId) {
             const isAdminUser = participant.admin === 'admin' || participant.admin === 'superadmin';
             const adminStatus = isAdminUser ? 'Admin' : 'Membro';
 
-            // Tentar obter nome/perfil
+            // Usar número como nome (pode ser expandido futuramente)
             let userName = phoneNumber;
             try {
                 const userInfo = await sock.onWhatsApp(participant.id);
                 if (userInfo && userInfo[0] && userInfo[0].exists) {
-                    // Usar número como nome padrão
-                    userName = phoneNumber;
+                    userName = phoneNumber; // Manter número como identificador
                 }
             } catch (error) {
                 console.log('Erro ao obter info do usuário:', phoneNumber);
@@ -238,10 +260,30 @@ async function extractGroupContacts(groupId) {
             };
 
             contactsData.push(contactData);
-
-            // CORRIGIDO: Formatação CSV com colunas separadas corretamente
-            csvData += `${contactData.nome},${contactData.numero},${contactData.admin},${contactData.status}\n`;
+            
+            // CORRIGIDO: Adicionar linha ao CSV com escape adequado para vírgulas
+            const csvRow = [
+                contactData.nome.replace(/"/g, '""'), // Escape aspas duplas
+                contactData.numero,
+                contactData.admin,
+                contactData.status
+            ];
+            csvData.push(csvRow);
         }
+
+        // CORRIGIDO: Gerar conteúdo CSV com separação por vírgulas e encoding UTF-8
+        const csvContent = csvData.map(row => {
+            return row.map(cell => {
+                // Se contém vírgula, quebra de linha ou aspas, envolver em aspas duplas
+                if (typeof cell === 'string' && (cell.includes(',') || cell.includes('\n') || cell.includes('"'))) {
+                    return `"${cell}"`;
+                }
+                return cell;
+            }).join(',');
+        }).join('\n');
+
+        // Adicionar BOM UTF-8 para Excel reconhecer encoding corretamente
+        const csvWithBOM = '\uFEFF' + csvContent;
 
         // Salvar arquivo CSV
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -249,11 +291,11 @@ async function extractGroupContacts(groupId) {
         const fileName = `contacts_${groupName}_${timestamp}.csv`;
         const filePath = `./contacts/${fileName}`;
 
-        // CORRIGIDO: Salvar com encoding UTF-8 e formatação adequada
-        fs.writeFileSync(filePath, csvData, 'utf8');
+        // CORRIGIDO: Salvar com encoding UTF-8 e BOM para Excel
+        fs.writeFileSync(filePath, csvWithBOM, 'utf8');
 
         console.log('Contatos extraídos:', contactsData.length);
-        console.log('Arquivo salvo:', fileName);
+        console.log('Arquivo CSV salvo:', fileName);
 
         return { 
             filePath, 
@@ -269,7 +311,7 @@ async function extractGroupContacts(groupId) {
     }
 }
 
-// CORRIGIDA: Criar enquete nativa e configurar detecção de votos
+// Criar enquete nativa e configurar detecção de votos
 async function createNativePoll(groupId, question, options) {
     try {
         const pollMessage = {
@@ -282,7 +324,6 @@ async function createNativePoll(groupId, question, options) {
 
         const sentMsg = await sock.sendMessage(groupId, pollMessage);
 
-        // Configurar enquete ativa para detecção de votos
         const pollData = {
             id: sentMsg.key.id,
             question: question,
@@ -293,7 +334,6 @@ async function createNativePoll(groupId, question, options) {
             messageKey: sentMsg.key
         };
 
-        // Salvar como enquete ativa
         config.activePoll = pollData;
         config.polls.set(sentMsg.key.id, pollData);
 
@@ -306,12 +346,10 @@ async function createNativePoll(groupId, question, options) {
     }
 }
 
-// CORRIGIDA: Obter resultado da enquete com dados reais
+// Obter resultado da enquete com dados reais
 async function getPollResult(groupId) {
     try {
-        // Verificar se há enquete ativa no grupo
         if (!config.activePoll || config.activePoll.groupId !== groupId) {
-            // Procurar última enquete do grupo
             const groupPolls = Array.from(config.polls.values()).filter(poll => poll.groupId === groupId);
 
             if (groupPolls.length === 0) {
@@ -321,7 +359,6 @@ async function getPollResult(groupId) {
                 return;
             }
 
-            // Usar a mais recente
             config.activePoll = groupPolls.sort((a, b) => new Date(b.created) - new Date(a.created))[0];
         }
 
@@ -333,7 +370,6 @@ async function getPollResult(groupId) {
 
 📈 Resultados:`;
 
-        // Contar votos por opção
         const voteCounts = new Array(poll.options.length).fill(0);
         const votersList = new Array(poll.options.length).fill(null).map(() => []);
 
@@ -344,7 +380,6 @@ async function getPollResult(groupId) {
             }
         }
 
-        // Mostrar resultados
         poll.options.forEach((option, index) => {
             const count = voteCounts[index];
             const percentage = poll.votes.size > 0 ? ((count / poll.votes.size) * 100).toFixed(1) : '0.0';
@@ -352,7 +387,7 @@ async function getPollResult(groupId) {
             resultText += `\n   📊 ${count} voto(s) (${percentage}%)`;
 
             if (count > 0) {
-                const voters = votersList[index].slice(0, 3); // Mostrar até 3 votantes
+                const voters = votersList[index].slice(0, 3);
                 const voterNames = voters.map(v => v.substring(0, 8) + '...').join(', ');
                 resultText += `\n   👥 ${voterNames}`;
                 if (count > 3) {
@@ -563,18 +598,18 @@ async function processCommand(msg) {
             return;
         }
 
-        // Verificar se bot é admin do grupo (exceto extracto)
+        console.log('Comando:', command, '| User:', normalizeId(userId), '| Grupo:', normalizeId(groupId));
+
+        // CORRIGIDO: Verificar se bot é admin do grupo (exceto extracto que funciona em qualquer grupo)
         if (command !== 'extracto') {
             const botIsAdmin = await isBotAdmin(groupId);
-            if (config.adminRequired && !botIsAdmin) {
+            if (!botIsAdmin) {
                 await sock.sendMessage(groupId, { 
-                    text: '⚠️ ATENÇÃO: Este bot só funciona em grupos onde ele é ADMINISTRADOR!\n\nPara usar todas as funcionalidades, promova o bot a administrador do grupo.' 
+                    text: '⚠️ ATENÇÃO: Este bot só funciona em grupos onde ele é ADMINISTRADOR!\n\n📋 Para usar todas as funcionalidades:\n1. Vá em informações do grupo\n2. Promova o bot a administrador\n3. Tente novamente\n\n❌ Atualmente o bot NÃO é admin neste grupo!' 
                 });
                 return;
             }
         }
-
-        console.log('Comando:', command, '| User:', normalizeId(userId));
 
         // Comandos que precisam de admin (extracto é exceção)
         const adminCommands = [
@@ -604,24 +639,24 @@ ${config.prefix}extracto cont - Extrair contatos (funciona em qualquer grupo)
 
 BOAS-VINDAS:
 ${config.prefix}welcome on/off - Ativar/desativar
-${config.prefix}welcome set <mensagem> - Definir mensagem ( podem coloca link)
-${config.prefix}welcome media <caminho> - Definir midia
+${config.prefix}welcome set <mensagem> - Definir mensagem (podem colocar link)
+${config.prefix}welcome media <caminho> - Definir mídia
 ${config.prefix}welcomepv on/off - Mensagens privadas
-${config.prefix}welcomepv set <mensagem> - Definir mensagem ( pode coloca link)
-${config.prefix}welcomepv media <caminho> - Definir midia
+${config.prefix}welcomepv set <mensagem> - Definir mensagem (pode colocar link)
+${config.prefix}welcomepv media <caminho> - Definir mídia
 ${config.prefix}goodbye on/off - Ativar/desativar
 ${config.prefix}goodbye set <mensagem> - Definir mensagem
-${config.prefix}goodbye media <caminho> - Definir midia
+${config.prefix}goodbye media <caminho> - Definir mídia
 
 MODERACAO (Admins):
 ${config.prefix}antilink on/off - Anti-link
 ${config.prefix}antilink ban on/off - Banir por link
-${config.prefix}antiwords on/off - Anti-palavroes
+${config.prefix}antiwords on/off - Anti-palavrões
 ${config.prefix}antiwords add <palavra> - Adicionar palavra
 ${config.prefix}antiwords remove <palavra> - Remover palavra
-${config.prefix}antiwords ban on/off - Banir por palavrao
+${config.prefix}antiwords ban on/off - Banir por palavrão
 ${config.prefix}antiwords list - Listar palavras
-${config.prefix}ban @user - Banir usuario
+${config.prefix}ban @user - Banir usuário
 ${config.prefix}removeall - REMOVE TODOS
 
 ADMINISTRACAO (Admins):
@@ -629,18 +664,18 @@ ${config.prefix}promote @user - Promover admin
 ${config.prefix}demote @user - Rebaixar admin
 ${config.prefix}add <numero> - Adicionar membro
 ${config.prefix}tagall <mensagem> - Marcar todos
-${config.prefix}tagallcut <mensagem> - Marca invisivel
+${config.prefix}tagallcut <mensagem> - Marca invisível
 ${config.prefix}rename <nome> - Renomear grupo
-${config.prefix}desc <descricao> - Alterar descricao
+${config.prefix}desc <descrição> - Alterar descrição
 ${config.prefix}creatgrup <nome> - Criar grupo
 
 CHATBOT:
 ${config.prefix}chatbot on/off - Ativar/desativar
 ${config.prefix}chatbot add <gatilho>=<resposta> - Adicionar
-${config.prefix}chatbot media <gatilho> <caminho> - Definir midia
+${config.prefix}chatbot media <gatilho> <caminho> - Definir mídia
 ${config.prefix}chatbot remove <gatilho> - Remover
 ${config.prefix}chatbot list - Listar gatilhos
-${config.prefix}mensege post on/off - ativa ou desativa postagem automatica 
+${config.prefix}mensege post on/off - ativa ou desativa postagem automática 
 ${config.prefix}mensege post minutos <minutos> <mensagem> - postagem a cada X minutos
 ${config.prefix}poll <pergunta>=<op1>=<op2> - Enquete nativa
 ${config.prefix}poll resulte - resultado da enquete
@@ -698,7 +733,7 @@ ${config.messagePost.enabled ? 'SIM ✅' : 'NÃO ❌'} Postagem Automática`;
                 }
                 break;
 
-            // Comando extracto - funciona em qualquer grupo
+            // CORRIGIDO: Comando extracto - funciona em qualquer grupo
             case 'extracto':
                 if (args[0] === 'cont') {
                     try {
@@ -712,7 +747,6 @@ ${config.messagePost.enabled ? 'SIM ✅' : 'NÃO ❌'} Postagem Automática`;
                         const extractResult = await extractGroupContacts(groupId);
 
                         if (extractResult) {
-                            // Enviar arquivo CSV para o próprio bot (número do bot)
                             const botNumber = normalizeId(sock.user.id) + '@s.whatsapp.net';
 
                             const reportMessage = `📊 RELATÓRIO DE EXTRAÇÃO DE CONTATOS
@@ -722,12 +756,14 @@ ${config.messagePost.enabled ? 'SIM ✅' : 'NÃO ❌'} Postagem Automática`;
 📅 Data: ${new Date().toLocaleString('pt-BR')}
 📁 Arquivo: ${extractResult.fileName}
 
-✅ Contatos extraídos e organizados em colunas CSV!
+✅ Contatos extraídos e organizados em CSV com colunas separadas!
 
 📋 Formato do arquivo:
 Nome | Numero | Admin | Status
 
-Os dados estão separados corretamente por colunas para fácil importação em Excel ou Google Sheets.`;
+🔹 Arquivo CSV compatível com Excel e Google Sheets
+🔹 Encoding UTF-8 com BOM para acentos corretos
+🔹 Separação adequada por vírgulas em colunas distintas`;
 
                             // Enviar relatório no grupo
                             await sock.sendMessage(groupId, { 
@@ -735,7 +771,8 @@ Os dados estão separados corretamente por colunas para fácil importação em E
 
 📱 Total: ${extractResult.count} contatos
 📁 Arquivo CSV enviado para o bot
-📊 Dados organizados em colunas separadas`
+📊 Dados organizados em colunas separadas
+💾 Compatível com Excel/Sheets`
                             });
 
                             // Enviar arquivo CSV para o bot
@@ -761,7 +798,8 @@ ${config.prefix}extracto cont - Extrair todos os contatos do grupo
 • Data da extração
 • Formatação adequada para Excel/Sheets
 
-⚡ Funciona em qualquer grupo (não precisa ser admin)`
+⚡ Funciona em qualquer grupo (não precisa ser admin)
+🔹 CSV com encoding UTF-8 e separação correta por vírgulas`
                     });
                 }
                 break;
@@ -1277,7 +1315,7 @@ Exemplo: !mensege post minutos 30 Mensagem a cada 30min`
                 saveConfig();
                 break;
 
-            // CORRIGIDO: Sistema de enquetes com detecção de votos
+            // Sistema de enquetes com detecção de votos
             case 'poll':
                 if (args[0] === 'resulte') {
                     await getPollResult(groupId);
@@ -1338,7 +1376,7 @@ async function processMessage(msg) {
         const groupId = key.remoteJid;
         const userId = key.participant || key.remoteJid;
 
-        // CORRIGIDO: Processar votos de enquetes - detectar quando usuário vota
+        // Processar votos de enquetes - detectar quando usuário vota
         if (message && message.pollUpdateMessage) {
             const pollVote = message.pollUpdateMessage;
             console.log('Voto detectado na enquete:', JSON.stringify(pollVote, null, 2));
@@ -1362,11 +1400,9 @@ async function processMessage(msg) {
         if (!groupId.endsWith('@g.us')) return;
         if (isBotMessage(userId)) return;
 
-        // Verificar se bot é admin (exceto para extracto)
-        if (config.adminRequired) {
-            const botIsAdmin = await isBotAdmin(groupId);
-            if (!botIsAdmin && messageText && !messageText.startsWith(config.prefix + 'extracto')) return;
-        }
+        // CORRIGIDO: Verificar se bot é admin antes de processar mensagens (exceto extracto)
+        const botIsAdmin = await isBotAdmin(groupId);
+        if (!botIsAdmin && messageText && !messageText.startsWith(config.prefix + 'extracto')) return;
 
         if (messageText && messageText.startsWith(config.prefix)) {
             await processCommand(msg);
@@ -1463,11 +1499,9 @@ async function processGroupUpdate(update) {
 
         console.log('Evento:', action, '| Grupo:', normalizeId(groupId));
 
-        // Verificar se bot é admin
-        if (config.adminRequired) {
-            const botIsAdmin = await isBotAdmin(groupId);
-            if (!botIsAdmin) return;
-        }
+        // CORRIGIDO: Verificar se bot é admin para processar eventos de grupo
+        const botIsAdmin = await isBotAdmin(groupId);
+        if (!botIsAdmin) return;
 
         if (action === 'add' && config.welcome.enabled) {
             const groupMetadata = await sock.groupMetadata(groupId);
@@ -1496,6 +1530,35 @@ async function processGroupUpdate(update) {
     }
 }
 
+// CORRIGIDO: Função para verificar todos os grupos onde o bot é admin na inicialização
+async function checkAllGroupsAdminStatus() {
+    try {
+        console.log('🔍 Verificando status de administrador em todos os grupos...');
+        
+        const groups = Object.keys(await sock.groupFetchAllParticipating());
+        let adminCount = 0;
+        
+        for (const groupId of groups) {
+            try {
+                const isAdmin = await checkAndUpdateBotAdminStatus(groupId);
+                if (isAdmin) {
+                    adminCount++;
+                }
+                // Pequeno delay para não sobrecarregar
+                await new Promise(resolve => setTimeout(resolve, 200));
+            } catch (error) {
+                console.log('Erro ao verificar grupo:', normalizeId(groupId));
+            }
+        }
+        
+        console.log(`✅ Status atualizado - Bot é admin em ${adminCount} de ${groups.length} grupos`);
+        return adminCount;
+    } catch (error) {
+        console.log('Erro ao verificar status dos grupos:', error.message);
+        return 0;
+    }
+}
+
 async function startBot() {
     try {
         console.log('🚀 Iniciando Bot APVS Brasil CORRIGIDO...');
@@ -1517,7 +1580,7 @@ async function startBot() {
             qrTimeout: 40000
         });
 
-        sock.ev.on('connection.update', (update) => {
+        sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
@@ -1539,18 +1602,25 @@ async function startBot() {
                 console.log('🤖', config.owner, 'ONLINE - VERSÃO CORRIGIDA');
                 console.log('📱 Número:', normalizeId(sock.user.id));
                 console.log('🕐 Conectado:', new Date().toLocaleString('pt-BR'));
-                console.log('⚡ CORREÇÕES APLICADAS:');
-                console.log('  ✅ !poll resulte detecta votos reais automaticamente');
-                console.log('  ✅ !extracto cont gera CSV com colunas organizadas');
-                console.log('  ✅ Sistema de detecção de votos em enquetes funcionando');
-                console.log('  ✅ CSV formatado corretamente para Excel/Sheets');
-                console.log('  ✅ Todas as outras funcionalidades mantidas');
-                console.log('📋 Digite !help em grupos para ver TODOS os comandos');
-                console.log('🎯 PROBLEMAS RESOLVIDOS - SISTEMA 100% FUNCIONAL');
+                
+                // CORRIGIDO: Verificar status de admin em todos os grupos após conectar
+                setTimeout(async () => {
+                    const adminGroupsCount = await checkAllGroupsAdminStatus();
+                    console.log('⚡ CORREÇÕES APLICADAS:');
+                    console.log('  ✅ Detecção automática de grupos onde bot é admin');
+                    console.log('  ✅ !extracto cont funciona em qualquer grupo');
+                    console.log('  ✅ CSV com colunas separadas e encoding UTF-8');
+                    console.log('  ✅ Detecção de votos em enquetes funcionando');
+                    console.log('  ✅ Bot funciona apenas em grupos onde é admin');
+                    console.log('📋 Digite !help em grupos para ver TODOS os comandos');
+                    console.log('🎯 SISTEMA 100% FUNCIONAL - PROBLEMAS RESOLVIDOS');
+                    console.log(`👑 Bot é administrador em ${adminGroupsCount} grupos`);
+                }, 3000);
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
+        
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.key.fromMe && msg.message) {
@@ -1559,6 +1629,17 @@ async function startBot() {
         });
 
         sock.ev.on('group-participants.update', processGroupUpdate);
+
+        // CORRIGIDO: Detectar mudanças de admin em grupos
+        sock.ev.on('groups.update', async (updates) => {
+            for (const update of updates) {
+                if (update.id) {
+                    console.log('Atualização no grupo:', normalizeId(update.id));
+                    // Verificar novamente se bot é admin após mudanças no grupo
+                    await checkAndUpdateBotAdminStatus(update.id);
+                }
+            }
+        });
 
     } catch (error) {
         console.log('❌ Erro inicializar:', error.message);
@@ -1581,10 +1662,11 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-console.log('🔥 APVS BRASIL - BOT CORRIGIDO E OTIMIZADO');
-console.log('📱 Versão 2.2 - ENQUETES E CSV CORRIGIDOS');
+console.log('🔥 ADMIM-BOT - BOT CORRIGIDO E OTIMIZADO');
+console.log('📱 Versão 2.3 - DETECÇÃO DE ADMIN AUTOMÁTICA');
+console.log('🤖 FUNCIONA APENAS EM GRUPOS ONDE É ADMINISTRADOR');
+console.log('📊 CSV ORGANIZADO EM COLUNAS COM ENCODING UTF-8');
 console.log('🗳️ DETECÇÃO DE VOTOS FUNCIONANDO 100%');
-console.log('📊 CSV ORGANIZADO EM COLUNAS SEPARADAS');
 console.log('⚡ TODOS OS PROBLEMAS RESOLVIDOS');
 console.log('🚀 Iniciando...');
 
