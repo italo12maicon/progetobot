@@ -24,8 +24,11 @@ function saveConfig() {
 }
 
 const client = new Client({
-  authStrategy: new LocalAuth({ clientId: 'Admim-Bot', dataPath: SESSION_DIR }),
-  puppeteer: { headless: true }
+  authStrategy: new LocalAuth({ clientId: 'Admim-Bot', dataPath: path.join(__dirname, 'session') }),
+  puppeteer: {
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  }
 });
 
 client.on('qr', qr => qrcode.generate(qr, { small: true }));
@@ -432,3 +435,4 @@ Chatbot:
 });
 
 client.initialize();
+
